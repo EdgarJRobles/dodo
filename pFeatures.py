@@ -4,7 +4,7 @@ __title__ = "pypeTools objects"
 __author__ = "oddtopus"
 __url__ = "github.com/oddtopus/dodo"
 __license__ = "LGPL 3"
-objs = ["Pipe", "Elbow", "Reduct", "Cap", "Flange", "Tee", "Ubolt", "Valve"]
+objs = ["Pipe", "Elbow", "Reduct", "Cap", "Flange", "Tee", "Ubolt", "BeamClamp", "Valve"]
 metaObjs = ["PypeLine", "PypeBranch"]
 
 from os.path import abspath, dirname, join
@@ -596,19 +596,29 @@ class Flange(pypeType):
                 base = base.cut(hole)
                 hole.rotate(FreeCAD.Vector(0, 0, 0), FreeCAD.Vector(0, 0, 1), 360.0 / fp.n)
         # creates flange thickness
-        flange = base.extrude(FreeCAD.Vector(0, 0, fp.t)) 
-        fp.ViewObject.Deviation = 0.10
+        flange = base.extrude(FreeCAD.Vector(0, 0, fp.t))
+        # Tessellation quality is a display setting, and ViewObject is None in
+        # console mode. Setting it unguarded raised AttributeError mid-execute,
+        # which recompute swallows -- so every Flange came back with a NULL
+        # shape and no error, headless.
+        if FreeCAD.GuiUp and fp.ViewObject is not None:
+            fp.ViewObject.Deviation = 0.10
         if (
             fp.FlangeType == "SW"
             or fp.FlangeType == "WN"
             or fp.FlangeType == "LJ"
             or fp.FlangeType == "SO"
         ):
-            # creates flange neck (corrected for raised face addition)
-            nn = Part.makeCylinder(fp.ODp / 2, fp.T1, vO, vZ).cut(
-                Part.makeCylinder(fp.d / 2, fp.T1, vO, vZ)
-            )
-            flange = flange.fuse(nn)
+            # creates flange neck (corrected for raised face addition).
+            # Only when it has real dimensions: ODp/T1 are documented OPTIONAL,
+            # and building a zero-radius zero-height cylinder produced a
+            # degenerate solid that fused into an invalid shape rather than
+            # being skipped.
+            if fp.ODp > 0 and fp.T1 > 0 and fp.ODp > fp.d:
+                nn = Part.makeCylinder(fp.ODp / 2, fp.T1, vO, vZ).cut(
+                    Part.makeCylinder(fp.d / 2, fp.T1, vO, vZ)
+                )
+                flange = flange.fuse(nn)
             if fp.trf > 0 and fp.drf < fp.D:
                 rf = Part.makeCylinder(fp.drf / 2, fp.trf, vO, vZ * -1).cut(
                     Part.makeCylinder(fp.d / 2, fp.trf, vO, vZ * -1)
@@ -1039,9 +1049,13 @@ class Tee(pypeType):
                 except Exception as e:
                     # Fillet failed -- fall back to unfilleted shape rather than
                     # crashing the whole recompute
+                    # float() because fillet_r is a Base.Quantity, which has no
+                    # numeric __format__ -- the fallback that exists to avoid
+                    # crashing the recompute was itself raising TypeError and
+                    # taking the Tee down with it.
                     FreeCAD.Console.PrintWarning(
                         "Tee fillet failed (r={:.2f}mm): {} -- using unfilleted shape\n"
-                        .format(fillet_r, e)
+                        .format(float(fillet_r), e)
                     )
 
         fp.Shape = Base
@@ -1671,6 +1685,155 @@ class Ubolt:
         fp.Shape = path.makePipe(p)
         fp.Ports = [FreeCAD.Vector(0, 0, 1)] #not quite sure why a U-bolt has a port?
 
+
+class BeamClamp:
+    """Class for object PType="Clamp".
+    BeamClamp(obj,[PSize="LA037-short", ClampType="Beam", ProductCode="LA037",
+                   Bolt="M10", Y=20, X=11, V=4, T=5, W=26])
+      obj: the "App::FeaturePython" object
+      PSize (string): catalog size row
+      ClampType (string): clamp family
+      ProductCode (string): vendor product code
+      Bolt (string): nominal fastener size
+      Y, X, V, T, W (float): catalog dimensions in mm
+    """
+
+    def __init__(
+        self,
+        obj,
+        PSize="LA037-short",
+        ClampType="Beam",
+        ProductCode="LA037",
+        Bolt="M10",
+        Y=20,
+        X=11,
+        V=4,
+        T=5,
+        W=26,
+    ):
+        obj.Proxy = self
+        obj.addProperty(
+            "App::PropertyString",
+            "PType",
+            "BeamClamp",
+            QT_TRANSLATE_NOOP("App::Property", "Type of pipeFeature"),
+        ).PType = "Clamp"
+        obj.addProperty(
+            "App::PropertyString",
+            "ClampType",
+            "BeamClamp",
+            QT_TRANSLATE_NOOP("App::Property", "Type of clamp"),
+        ).ClampType = ClampType
+        obj.addProperty(
+            "App::PropertyString",
+            "PSize",
+            "BeamClamp",
+            QT_TRANSLATE_NOOP("App::Property", "Size of clamp"),
+        ).PSize = PSize
+        obj.addProperty(
+            "App::PropertyString",
+            "ProductCode",
+            "BeamClamp",
+            QT_TRANSLATE_NOOP("App::Property", "Catalog product code"),
+        ).ProductCode = ProductCode
+        obj.addProperty(
+            "App::PropertyString",
+            "Bolt",
+            "BeamClamp",
+            QT_TRANSLATE_NOOP("App::Property", "Bolt size"),
+        ).Bolt = Bolt
+        for prop, value, text in [
+            ("Y", Y, "Clamp height"),
+            ("X", X, "Clamp body length"),
+            ("V", V, "Tail length"),
+            ("T", T, "Clamp thickness"),
+            ("W", W, "Clamp width"),
+        ]:
+            obj.addProperty(
+                "App::PropertyLength",
+                prop,
+                "BeamClamp",
+                QT_TRANSLATE_NOOP("App::Property", text),
+            )
+            setattr(obj, prop, value)
+        obj.addProperty(
+            "App::PropertyVectorList",
+            "Ports",
+            "PBase",
+            QT_TRANSLATE_NOOP("App::Property", "Ports position relative to the origin of Shape"),
+        )
+        self.execute(obj)
+
+    def onChanged(self, fp, prop):
+        return None
+
+    def execute(self, fp):
+        height = float(fp.Y)
+        body_len = float(fp.X)
+        tail_len = float(fp.V)
+        thk = float(fp.T)
+        width = float(fp.W)
+        bolt_dia = self._bolt_diameter(fp.Bolt, max(height * 0.5, 1))
+
+        body = Part.makeBox(
+            body_len,
+            width,
+            height,
+            FreeCAD.Vector(-body_len / 2, -width / 2, 0),
+        )
+        tail = Part.makeBox(
+            tail_len,
+            width,
+            thk,
+            FreeCAD.Vector(body_len / 2, -width / 2, 0),
+        )
+        nose = Part.makeBox(
+            thk,
+            width,
+            thk,
+            FreeCAD.Vector(-body_len / 2 - thk, -width / 2, -thk),
+        )
+        lower_grip = Part.makeBox(
+            max(body_len * 0.45, thk),
+            width,
+            thk,
+            FreeCAD.Vector(-body_len / 2, -width / 2, -thk),
+        )
+        boss = Part.makeCylinder(
+            bolt_dia * 0.75,
+            thk,
+            FreeCAD.Vector(0, 0, height),
+            vZ,
+        )
+        clearance = Part.makeCylinder(
+            bolt_dia * 0.58,
+            height + thk * 3,
+            FreeCAD.Vector(0, 0, -thk * 1.5),
+            vZ,
+        )
+        clamp = body.fuse(tail).fuse(nose).fuse(lower_grip).fuse(boss).cut(clearance)
+        bolt = Part.makeCylinder(
+            bolt_dia * 0.42,
+            height + thk * 3,
+            FreeCAD.Vector(0, 0, -thk * 1.5),
+            vZ,
+        )
+        head = Part.makeCylinder(
+            bolt_dia * 0.85,
+            thk * 0.8,
+            FreeCAD.Vector(0, 0, height + thk),
+            vZ,
+        )
+        fp.Shape = clamp.fuse(bolt).fuse(head)
+        fp.Ports = [FreeCAD.Vector(0, 0, 0)]
+
+    def _bolt_diameter(self, bolt, fallback):
+        try:
+            return float(str(bolt).strip().upper().replace("M", ""))
+        except Exception:
+            return fallback
+
+
 class Shell:
     """
     Class for a lateral-shell-of-tank object
@@ -1816,6 +1979,8 @@ class Valve(pypeType):
       flgdf   (float) : bolt-circle diameter   (from blind flange table)
       flgf    (float) : bolt-hole diameter     (from blind flange table)
       flgn    (int)   : number of bolt holes   (from blind flange table)
+      BottomH (float) : lower body envelope from pipe centerline (optional)
+      TopH    (float) : upper body envelope from pipe centerline (optional)
 
     Local coordinate system (all variants)
     ----------------------------------------
@@ -1832,7 +1997,7 @@ class Valve(pypeType):
                  OD=None, E=None, Conn=None,
                  flgD=0, flgt=0, flgdrf=0, flgtrf=0,
                  flgdf=0, flgf=0, flgn=0,
-                 actuator="Handle", topH=0, wheelD=0):
+                 actuator="Handle", bottomH=0, topH=0):
         super(Valve, self).__init__(obj)
         obj.Proxy   = self
         obj.PType   = "Valve"
@@ -1893,15 +2058,15 @@ class Valve(pypeType):
                                   "Actuator type: Handle or Gearbox"),
             ).Actuator = actuator
             obj.addProperty(
+                "App::PropertyLength", "BottomH", "Valve",
+                QT_TRANSLATE_NOOP("App::Property",
+                                  "Lower body envelope from valve centerline"),
+            ).BottomH = bottomH
+            obj.addProperty(
                 "App::PropertyLength", "TopH", "Valve",
                 QT_TRANSLATE_NOOP("App::Property",
-                                  "Centerline-to-top height for tall valve operators"),
+                                  "Upper body envelope from valve centerline"),
             ).TopH = topH
-            obj.addProperty(
-                "App::PropertyLength", "WheelD", "Valve",
-                QT_TRANSLATE_NOOP("App::Property",
-                                  "Handwheel diameter"),
-            ).WheelD = wheelD
 
         elif Conn is not None:
             # -- Socket-weld / Threaded valve properties ---------------------
@@ -1942,8 +2107,9 @@ class Valve(pypeType):
         # to ensure correct dispatch when the proxy is reconstructed on reload.
         _flanged = ("150lb", "300lb", "600lb", "900lb", "1500lb", "2500lb")
         if conn is not None and conn.strip() in _flanged:
-            if fp.PRating.lower().find("gate") + 1:
-                self._execute_gate_valve(fp, H)
+            rating = getattr(fp, "PRating", "").lower()
+            if "check_swing" in rating or "swing_check" in rating:
+                self._execute_swing_check_valve(fp, H)
             else:
                 self._execute_flanged(fp, H)
         elif conn is not None:
@@ -2231,6 +2397,164 @@ class Valve(pypeType):
             FreeCAD.Vector(0, 0, -1),
         ]
 
+    def _execute_swing_check_valve(self, fp, H):
+        """Build a flanged swing check valve using catalog envelope dimensions.
+
+        Local Z is the flow axis.  The swing-check-specific details are the
+        larger hinged body chamber, raised bolted bonnet, and side hinge boss.
+        """
+        import math
+
+        flgD   = float(fp.FlgD)
+        flgt   = float(fp.Flgt)
+        flgDrf = float(fp.FlgDrf)
+        flgTrf = float(fp.FlgTrf)
+        flgDf  = float(fp.FlgDf)
+        flgF   = float(fp.FlgF)
+        flgN   = int(fp.FlgN)
+
+        pipe_od = pipe_OD.get(fp.PSize, max(flgDrf * 0.65, 1.0))
+        bore_r = max(pipe_od * 0.95 / 2.0, 1.0)
+        bottom_h = float(getattr(fp, "BottomH", 0)) or max(pipe_od * 0.9, flgDrf * 0.45)
+        top_h = float(getattr(fp, "TopH", 0)) or max(pipe_od * 1.8, flgD * 0.85)
+
+        def make_bl_flange(z_face, face_up):
+            sign = 1.0 if face_up else -1.0
+            base = Part.Face(Part.Wire(Part.makeCircle(flgD / 2.0)))
+            if flgN > 0 and flgF > 0 and flgDf > 0:
+                hole = Part.Face(
+                    Part.Wire(
+                        Part.makeCircle(
+                            flgF / 2.0,
+                            FreeCAD.Vector(flgDf / 2.0, 0, 0),
+                            FreeCAD.Vector(0, 0, 1),
+                        )
+                    )
+                )
+                hole.rotate(FreeCAD.Vector(0, 0, 0),
+                            FreeCAD.Vector(0, 0, 1), 360.0 / flgN / 2.0)
+                for i in range(flgN):
+                    base = base.cut(hole)
+                    hole.rotate(FreeCAD.Vector(0, 0, 0),
+                                FreeCAD.Vector(0, 0, 1), 360.0 / flgN)
+
+            flange = base.extrude(FreeCAD.Vector(0, 0, sign * flgt))
+            if flgTrf > 0 and flgDrf > 0:
+                rf = Part.makeCylinder(
+                    flgDrf / 2.0, flgTrf,
+                    FreeCAD.Vector(0, 0, 0),
+                    FreeCAD.Vector(0, 0, -sign),
+                )
+                flange = flange.fuse(rf)
+            flange.translate(FreeCAD.Vector(0, 0, z_face + flgTrf * sign))
+            return flange
+
+        flange_bot = make_bl_flange(-H / 2.0, face_up=True)
+        flange_top = make_bl_flange(H / 2.0, face_up=False)
+
+        sleeve_r = max(flgDrf / 2.0, bore_r + max(6.0, flgt * 0.35))
+        sleeve = Part.makeCylinder(
+            sleeve_r, H,
+            FreeCAD.Vector(0, 0, -H / 2.0),
+            FreeCAD.Vector(0, 0, 1),
+        )
+
+        chamber_len = max(pipe_od * 1.55, min(H - 2.0 * flgt, H * 0.58))
+        chamber_r = max(
+            bore_r + max(8.0, flgt * 0.35),
+            min(flgD * 0.46, bottom_h * 0.92, top_h * 0.55),
+        )
+        chamber = Part.makeCylinder(
+            chamber_r, chamber_len,
+            FreeCAD.Vector(0, 0, -chamber_len / 2.0),
+            FreeCAD.Vector(0, 0, 1),
+        )
+
+        # Raised bonnet and cover plate.  These are intentionally round in plan
+        # so the generated model remains robust across the full ASME size range.
+        cover_base_y = min(chamber_r * 0.70, top_h * 0.45)
+        cover_top_y = max(top_h, cover_base_y + max(12.0, flgt * 0.45))
+        cover_h = cover_top_y - cover_base_y
+        cover_r = max(
+            pipe_od * 0.42,
+            min(chamber_len * 0.34, chamber_r * 0.78, flgD * 0.34),
+        )
+        bonnet = Part.makeCone(
+            cover_r * 1.18, cover_r * 0.82, cover_h,
+            FreeCAD.Vector(0, cover_base_y, 0),
+            FreeCAD.Vector(0, 1, 0),
+        )
+        cover_plate_t = max(6.0, flgt * 0.18)
+        cover_plate = Part.makeCylinder(
+            cover_r * 1.05, cover_plate_t,
+            FreeCAD.Vector(0, cover_top_y - cover_plate_t * 0.45, 0),
+            FreeCAD.Vector(0, 1, 0),
+        )
+
+        # External hinge boss and end caps.
+        hinge_r = max(6.0, min(pipe_od * 0.12, chamber_r * 0.18))
+        hinge_len = max(flgD * 0.58, hinge_r * 5.0)
+        hinge_y = min(chamber_r * 0.46, bottom_h * 0.72)
+        hinge_z = -min(chamber_len * 0.20, H * 0.09)
+        hinge = Part.makeCylinder(
+            hinge_r, hinge_len,
+            FreeCAD.Vector(-hinge_len / 2.0, hinge_y, hinge_z),
+            FreeCAD.Vector(1, 0, 0),
+        )
+        cap_t = max(4.0, hinge_r * 0.55)
+        cap_l = Part.makeCylinder(
+            hinge_r * 1.45, cap_t,
+            FreeCAD.Vector(-hinge_len / 2.0 - cap_t * 0.35, hinge_y, hinge_z),
+            FreeCAD.Vector(1, 0, 0),
+        )
+        cap_r = Part.makeCylinder(
+            hinge_r * 1.45, cap_t,
+            FreeCAD.Vector(hinge_len / 2.0 - cap_t * 0.65, hinge_y, hinge_z),
+            FreeCAD.Vector(1, 0, 0),
+        )
+
+        valve = flange_bot.fuse(flange_top)
+        for shape in (sleeve, chamber, bonnet, cover_plate, hinge, cap_l, cap_r):
+            valve = valve.fuse(shape)
+
+        # Cover bolts are fused with a small overlap into the cover plate.
+        bolt_count = max(6, min(16, int(round(cover_r / 18.0)) * 2))
+        bolt_r = max(2.0, min(8.0, cover_r * 0.045))
+        bolt_h = max(3.0, cover_plate_t * 0.55)
+        bolt_circle = cover_r * 0.72
+        bolt_y = cover_top_y + cover_plate_t * 0.06
+        for i in range(bolt_count):
+            a = 2.0 * math.pi * i / bolt_count
+            pos = FreeCAD.Vector(
+                bolt_circle * math.cos(a),
+                bolt_y,
+                bolt_circle * math.sin(a),
+            )
+            bolt = Part.makeCylinder(
+                bolt_r, bolt_h,
+                pos,
+                FreeCAD.Vector(0, 1, 0),
+            )
+            valve = valve.fuse(bolt)
+
+        bore = Part.makeCylinder(
+            bore_r, H + 2.0 * flgt + 4.0,
+            FreeCAD.Vector(0, 0, -H / 2.0 - flgt - 2.0),
+            FreeCAD.Vector(0, 0, 1),
+        )
+        valve = valve.cut(bore)
+        valve = valve.removeSplitter()
+        fp.Shape = valve
+
+        fp.Ports = [
+            FreeCAD.Vector(0, 0, H / 2.0),
+            FreeCAD.Vector(0, 0, -H / 2.0),
+        ]
+        fp.PortDirections = [
+            FreeCAD.Vector(0, 0, 1),
+            FreeCAD.Vector(0, 0, -1),
+        ]
+
     def _execute_sw_th(self, fp, H):
         import math
 
@@ -2360,10 +2684,14 @@ class Valve(pypeType):
         ]
 
     def _execute_legacy(self, fp, H):
-        rating = fp.PRating.lower()
-        if rating.find("gate") + 1:
-            self._execute_gate_valve(fp, H)
+        if fp.PRating.lower().find("knife") + 1:
+            self._execute_knife_gate(fp, H)
             return
+        if fp.PRating.lower().find("pinch") + 1:
+            self._execute_pinch(fp, H)
+            return
+
+        rating = fp.PRating.lower()
 
         c = Part.makeCone(fp.ODBody / 2, fp.ODBody / 5, H / 2,
                           FreeCAD.Vector(0, 0, -H / 2))
@@ -2381,204 +2709,251 @@ class Valve(pypeType):
             FreeCAD.Vector(0, 0,  1),
         ]
 
-    def _execute_gate_valve(self, fp, H):
-        def _nominal_diameter(psize):
-            try:
-                return float("".join(c for c in psize if c.isdigit() or c == "."))
-            except Exception:
-                return 0.0
+    def _execute_knife_gate(self, fp, H):
+        """Build a simple wafer-style knife gate valve for legacy CSV rows."""
+        import math
 
-        is_flanged = hasattr(fp, "FlgD")
-        nominal_d = _nominal_diameter(fp.PSize)
-        if is_flanged:
-            od_body = float(fp.FlgD)
-            flange_t = float(fp.Flgt)
-            bore = nominal_d or pipe_OD.get(fp.PSize, float(fp.FlgDrf) * 0.65)
-            pipe_od = pipe_OD.get(fp.PSize, bore)
-        else:
-            od_body = float(fp.ODBody)
-            bore = float(fp.ID)
-            pipe_od = pipe_OD.get(fp.PSize, bore)
-            flange_t = max(12.0, min(H * 0.09, 34.0))
+        pipe_od = pipe_OD.get(fp.PSize, float(fp.ID))
+        bore_d = max(float(fp.ID), pipe_od * 0.9)
+        body_d = max(float(fp.ODBody), pipe_od * 1.25)
+        gate_t = max(3.0, min(12.0, pipe_od * 0.035))
 
-        flange_r = od_body / 2.0
-        bore_r = bore / 2.0
-        wall = max(bore * 0.06, 8.0)
-        sleeve_r = max(pipe_od * 0.52, bore_r + wall)
-        sleeve_r = min(sleeve_r, flange_r * 0.72)
-        sleeve_r = max(sleeve_r, bore_r + wall)
-        chamber_r = max(sleeve_r * 1.32, bore_r + wall * 3.0)
-        chamber_r = min(chamber_r, flange_r * 0.82)
-        chamber_r = max(chamber_r, sleeve_r + wall)
-        body_len = max(H - 2.0 * flange_t, H * 0.42)
-        body_z0 = -body_len / 2.0
-
-        def make_rf_flange(z_face, inward):
-            base = Part.Face(Part.Wire(Part.makeCircle(flange_r)))
-            if is_flanged and int(fp.FlgN) > 0:
-                bolt = Part.Face(
-                    Part.Wire(
-                        Part.makeCircle(
-                            float(fp.FlgF) / 2.0,
-                            FreeCAD.Vector(float(fp.FlgDf) / 2.0, 0, 0),
-                            FreeCAD.Vector(0, 0, 1),
-                        )
-                    )
-                )
-                bolt.rotate(
-                    FreeCAD.Vector(0, 0, 0),
-                    FreeCAD.Vector(0, 0, 1),
-                    360.0 / int(fp.FlgN) / 2.0,
-                )
-                for _ in range(int(fp.FlgN)):
-                    base = base.cut(bolt)
-                    bolt.rotate(
-                        FreeCAD.Vector(0, 0, 0),
-                        FreeCAD.Vector(0, 0, 1),
-                        360.0 / int(fp.FlgN),
-                    )
-
-            flange = base.extrude(FreeCAD.Vector(0, 0, inward * flange_t))
-            if is_flanged and float(fp.FlgDrf) > 0 and float(fp.FlgTrf) > 0:
-                rf = Part.makeCylinder(
-                    float(fp.FlgDrf) / 2.0,
-                    float(fp.FlgTrf),
-                    FreeCAD.Vector(0, 0, 0),
-                    FreeCAD.Vector(0, 0, inward),
-                )
-                flange = flange.fuse(rf)
-            flange.translate(FreeCAD.Vector(0, 0, z_face))
-            return flange
-
-        sleeve = Part.makeCylinder(
-            sleeve_r, H,
+        body = Part.makeCylinder(
+            body_d / 2.0, H,
             FreeCAD.Vector(0, 0, -H / 2.0),
             FreeCAD.Vector(0, 0, 1),
         )
-        center_body = Part.makeCylinder(
-            chamber_r, body_len,
-            FreeCAD.Vector(0, 0, body_z0),
+        bore = Part.makeCylinder(
+            bore_d / 2.0, H + 2.0,
+            FreeCAD.Vector(0, 0, -H / 2.0 - 1.0),
             FreeCAD.Vector(0, 0, 1),
         )
-        flange_neg = make_rf_flange(-H / 2.0, 1.0)
-        flange_pos = make_rf_flange(H / 2.0, -1.0)
+        body = body.cut(bore)
 
-        top_h = float(getattr(fp, "TopH", 0)) or max(od_body * 1.55, bore * 4.2)
-        wheel_d = float(getattr(fp, "WheelD", 0)) or max(bore * 2.5, od_body * 0.85)
-        wheel_r = wheel_d / 2.0
-        wheel_t = max(min(wheel_r * 0.055, 12.0), 4.0)
-
-        bonnet_base_y = chamber_r * 0.34
-        bonnet_h = min(max(top_h * 0.28, chamber_r * 0.95), top_h * 0.46)
-        neck_r = max(bore * 0.16, 9.0)
-        bonnet = Part.makeCone(
-            chamber_r * 0.58, neck_r * 1.35, bonnet_h,
-            FreeCAD.Vector(0, bonnet_base_y, 0),
-            FreeCAD.Vector(0, 1, 0),
-        )
-        gland_h = max(bore * 0.16, 12.0)
-        bonnet_top_y = bonnet_base_y + bonnet_h
-        gland = Part.makeCylinder(
-            neck_r * 1.25, gland_h,
-            FreeCAD.Vector(0, bonnet_top_y - 1.0, 0),
-            FreeCAD.Vector(0, 1, 0),
+        # Flat bonnet/packing box across the top of the wafer body.
+        bonnet_w = body_d * 0.72
+        bonnet_h = max(pipe_od * 0.18, 18.0)
+        bonnet = Part.makeBox(
+            bonnet_w, bonnet_h, H * 1.12,
+            FreeCAD.Vector(-bonnet_w / 2.0, body_d / 2.0 - bonnet_h * 0.25, -H * 0.56),
         )
 
-        stem_r = max(min(bore * 0.045, 10.0), 4.0)
-        stem_y0 = bonnet_base_y
-        stem_top_y = max(top_h - wheel_t * 0.35, bonnet_top_y + gland_h + 10.0)
+        # Visible knife gate blade rising through the yoke.
+        blade_h = body_d * 0.95
+        blade_w = max(bore_d * 0.72, pipe_od * 0.55)
+        blade = Part.makeBox(
+            blade_w, gate_t, H * 0.45,
+            FreeCAD.Vector(-blade_w / 2.0, body_d / 2.0 - gate_t / 2.0, -H * 0.225),
+        )
+        blade.translate(FreeCAD.Vector(0, blade_h * 0.36, 0))
+
+        stem_r = max(3.0, min(10.0, pipe_od * 0.035))
+        stem_base_y = body_d / 2.0 + bonnet_h * 0.35
+        stem_h = body_d * 1.2
         stem = Part.makeCylinder(
-            stem_r, stem_top_y - stem_y0,
+            stem_r, stem_h,
+            FreeCAD.Vector(0, stem_base_y, 0),
+            FreeCAD.Vector(0, 1, 0),
+        )
+
+        # Two yoke posts and a crosshead frame around the rising stem.
+        post_r = max(3.0, stem_r * 0.8)
+        post_offset = body_d * 0.24
+        post_h = stem_h * 0.72
+        post_y0 = body_d / 2.0 + bonnet_h * 0.1
+        post1 = Part.makeCylinder(
+            post_r, post_h,
+            FreeCAD.Vector(-post_offset, post_y0, 0),
+            FreeCAD.Vector(0, 1, 0),
+        )
+        post2 = Part.makeCylinder(
+            post_r, post_h,
+            FreeCAD.Vector(post_offset, post_y0, 0),
+            FreeCAD.Vector(0, 1, 0),
+        )
+        cross = Part.makeBox(
+            post_offset * 2.0 + post_r * 2.0,
+            post_r * 2.0,
+            max(H * 0.35, gate_t * 2.0),
+            FreeCAD.Vector(
+                -post_offset - post_r,
+                post_y0 + post_h - post_r,
+                -max(H * 0.35, gate_t * 2.0) / 2.0,
+            ),
+        )
+
+        wheel_r = max(pipe_od * 0.32, 32.0)
+        wheel_tube_r = max(2.5, wheel_r * 0.06)
+        wheel_center = FreeCAD.Vector(0, stem_base_y + stem_h, 0)
+        wheel = Part.makeTorus(wheel_r, wheel_tube_r, wheel_center, FreeCAD.Vector(0, 1, 0))
+        hub = Part.makeCylinder(
+            wheel_tube_r * 1.6, wheel_tube_r * 4.0,
+            wheel_center - FreeCAD.Vector(0, wheel_tube_r * 2.0, 0),
+            FreeCAD.Vector(0, 1, 0),
+        )
+        spoke_r = max(1.5, wheel_tube_r * 0.45)
+        spokes = None
+        for angle in (0, 90, 180, 270):
+            rad = math.radians(angle)
+            direction = FreeCAD.Vector(math.cos(rad), 0, math.sin(rad))
+            spoke = Part.makeCylinder(
+                spoke_r, wheel_r,
+                wheel_center,
+                direction,
+            )
+            spokes = spoke if spokes is None else spokes.fuse(spoke)
+
+        valve = body.fuse(bonnet)
+        valve = valve.fuse(blade)
+        valve = valve.fuse(stem)
+        valve = valve.fuse(post1)
+        valve = valve.fuse(post2)
+        valve = valve.fuse(cross)
+        valve = valve.fuse(wheel)
+        valve = valve.fuse(hub)
+        if spokes is not None:
+            valve = valve.fuse(spokes)
+        fp.Shape = valve.removeSplitter()
+        fp.Ports = [
+            FreeCAD.Vector(0, 0, -H / 2),
+            FreeCAD.Vector(0, 0,  H / 2),
+        ]
+        fp.PortDirections = [
+            FreeCAD.Vector(0, 0, -1),
+            FreeCAD.Vector(0, 0,  1),
+        ]
+
+    def _execute_pinch(self, fp, H):
+        """Build a simple manual pinch valve for legacy CSV rows."""
+        pipe_od = pipe_OD.get(fp.PSize, float(fp.ID))
+        bore_d = max(float(fp.ID), pipe_od * 0.9)
+        body_d = max(float(fp.ODBody), pipe_od * 1.15)
+        flange_t = max(8.0, min(32.0, H * 0.09))
+
+        body = Part.makeCylinder(
+            body_d * 0.42, H,
+            FreeCAD.Vector(0, 0, -H / 2.0),
+            FreeCAD.Vector(0, 0, 1),
+        )
+
+        flange_neg = Part.makeCylinder(
+            body_d / 2.0, flange_t,
+            FreeCAD.Vector(0, 0, -H / 2.0),
+            FreeCAD.Vector(0, 0, 1),
+        )
+        flange_pos = Part.makeCylinder(
+            body_d / 2.0, flange_t,
+            FreeCAD.Vector(0, 0, H / 2.0 - flange_t),
+            FreeCAD.Vector(0, 0, 1),
+        )
+
+        # Flexible sleeve body with a pinched waist under the handwheel.
+        sleeve_len = max(1.0, H - 2.0 * flange_t)
+        sleeve = Part.makeCylinder(
+            body_d * 0.36, sleeve_len,
+            FreeCAD.Vector(0, 0, -sleeve_len / 2.0),
+            FreeCAD.Vector(0, 0, 1),
+        )
+        pinch_h = max(pipe_od * 0.16, 8.0)
+        pinch_w = body_d * 0.78
+        pinch_len = sleeve_len * 0.34
+        pinch_cut_top = Part.makeBox(
+            pinch_w, pinch_h, pinch_len,
+            FreeCAD.Vector(-pinch_w / 2.0, body_d * 0.18, -pinch_len / 2.0),
+        )
+        pinch_cut_bot = Part.makeBox(
+            pinch_w, pinch_h, pinch_len,
+            FreeCAD.Vector(-pinch_w / 2.0, -body_d * 0.18 - pinch_h, -pinch_len / 2.0),
+        )
+        sleeve = sleeve.cut(pinch_cut_top)
+        sleeve = sleeve.cut(pinch_cut_bot)
+
+        bore = Part.makeCylinder(
+            bore_d / 2.0, H + 2.0,
+            FreeCAD.Vector(0, 0, -H / 2.0 - 1.0),
+            FreeCAD.Vector(0, 0, 1),
+        )
+
+        bonnet_w = body_d * 0.58
+        bonnet_h = max(pipe_od * 0.16, 18.0)
+        bonnet_l = H * 0.42
+        bonnet = Part.makeBox(
+            bonnet_w, bonnet_h, bonnet_l,
+            FreeCAD.Vector(-bonnet_w / 2.0, body_d * 0.34, -bonnet_l / 2.0),
+        )
+
+        stem_r = max(3.0, min(10.0, pipe_od * 0.035))
+        stem_y0 = body_d * 0.34 + bonnet_h
+        stem_h = body_d * 0.72
+        stem = Part.makeCylinder(
+            stem_r, stem_h,
             FreeCAD.Vector(0, stem_y0, 0),
             FreeCAD.Vector(0, 1, 0),
         )
 
-        yoke_base_y = bonnet_top_y + gland_h * 0.45
-        wheel_center_y = max(top_h - wheel_t, yoke_base_y + wheel_r * 0.35)
-        yoke_offset = min(max(wheel_r * 0.32, neck_r * 1.6), chamber_r * 0.52)
-        pillar_r = max(stem_r * 0.9, 4.0)
-        pillar_len = max(wheel_center_y - yoke_base_y - wheel_t * 2.0, 1.0)
-        yoke_left = Part.makeCylinder(
-            pillar_r, pillar_len,
-            FreeCAD.Vector(-yoke_offset, yoke_base_y, 0),
+        yoke_r = max(3.0, stem_r * 0.85)
+        yoke_offset = body_d * 0.22
+        yoke_h = stem_h * 0.78
+        yoke_y0 = body_d * 0.35
+        yoke1 = Part.makeCylinder(
+            yoke_r, yoke_h,
+            FreeCAD.Vector(-yoke_offset, yoke_y0, 0),
             FreeCAD.Vector(0, 1, 0),
         )
-        yoke_right = Part.makeCylinder(
-            pillar_r, pillar_len,
-            FreeCAD.Vector(yoke_offset, yoke_base_y, 0),
+        yoke2 = Part.makeCylinder(
+            yoke_r, yoke_h,
+            FreeCAD.Vector(yoke_offset, yoke_y0, 0),
             FreeCAD.Vector(0, 1, 0),
         )
-        yoke_bridge = Part.makeCylinder(
-            pillar_r * 1.25, yoke_offset * 2.0 + pillar_r * 4.0,
-            FreeCAD.Vector(-yoke_offset - pillar_r * 2.0, yoke_base_y + pillar_len, 0),
-            FreeCAD.Vector(1, 0, 0),
-        )
-        yoke_lower_bridge = Part.makeCylinder(
-            pillar_r * 1.25, yoke_offset * 2.0 + pillar_r * 4.0,
-            FreeCAD.Vector(-yoke_offset - pillar_r * 2.0, yoke_base_y, 0),
-            FreeCAD.Vector(1, 0, 0),
+        cross_l = max(H * 0.22, yoke_r * 3.0)
+        cross = Part.makeBox(
+            yoke_offset * 2.0 + yoke_r * 2.0,
+            yoke_r * 2.0,
+            cross_l,
+            FreeCAD.Vector(-yoke_offset - yoke_r, yoke_y0 + yoke_h - yoke_r, -cross_l / 2.0),
         )
 
-        wheel_center = FreeCAD.Vector(0, wheel_center_y, 0)
-        handwheel = Part.makeTorus(
-            wheel_r, wheel_t, wheel_center, FreeCAD.Vector(0, 1, 0)
-        )
+        wheel_r = max(pipe_od * 0.3, 32.0)
+        wheel_tube = max(2.5, wheel_r * 0.06)
+        wheel_center = FreeCAD.Vector(0, stem_y0 + stem_h, 0)
+        wheel = Part.makeTorus(wheel_r, wheel_tube, wheel_center, FreeCAD.Vector(0, 1, 0))
         hub = Part.makeCylinder(
-            stem_r * 1.8, wheel_t * 3.0,
-            wheel_center - FreeCAD.Vector(0, wheel_t * 1.5, 0),
+            wheel_tube * 1.6, wheel_tube * 4.0,
+            wheel_center - FreeCAD.Vector(0, wheel_tube * 2.0, 0),
             FreeCAD.Vector(0, 1, 0),
         )
-        stem_nut = Part.makeCylinder(
-            stem_r * 2.4, wheel_t * 1.8,
-            wheel_center + FreeCAD.Vector(0, wheel_t * 0.8, 0),
-            FreeCAD.Vector(0, 1, 0),
-        )
-
-        spokes = None
-        for direction in (
+        spoke_x = Part.makeCylinder(
+            wheel_tube * 0.45, wheel_r * 2.0,
+            wheel_center - FreeCAD.Vector(wheel_r, 0, 0),
             FreeCAD.Vector(1, 0, 0),
-            FreeCAD.Vector(-1, 0, 0),
-            FreeCAD.Vector(0, 0, 1),
-            FreeCAD.Vector(0, 0, -1),
-        ):
-            spoke = Part.makeCylinder(
-                max(wheel_t * 0.55, 1.6), wheel_r + wheel_t * 1.5,
-                wheel_center, direction,
-            )
-            spokes = spoke if spokes is None else spokes.fuse(spoke)
-
-        bore_cut = Part.makeCylinder(
-            bore / 2.0, H + 4.0,
-            FreeCAD.Vector(0, 0, -H / 2.0 - 2.0),
+        )
+        spoke_z = Part.makeCylinder(
+            wheel_tube * 0.45, wheel_r * 2.0,
+            wheel_center - FreeCAD.Vector(0, 0, wheel_r),
             FreeCAD.Vector(0, 0, 1),
         )
 
-        valve = sleeve.fuse(center_body)
-        valve = valve.fuse(flange_neg)
+        valve = body.fuse(flange_neg)
         valve = valve.fuse(flange_pos)
+        valve = valve.fuse(sleeve)
         valve = valve.fuse(bonnet)
-        valve = valve.fuse(gland)
         valve = valve.fuse(stem)
-        valve = valve.fuse(yoke_left)
-        valve = valve.fuse(yoke_right)
-        valve = valve.fuse(yoke_bridge)
-        valve = valve.fuse(yoke_lower_bridge)
-        valve = valve.fuse(handwheel)
+        valve = valve.fuse(yoke1)
+        valve = valve.fuse(yoke2)
+        valve = valve.fuse(cross)
+        valve = valve.fuse(wheel)
         valve = valve.fuse(hub)
-        valve = valve.fuse(stem_nut)
-        if spokes is not None:
-            valve = valve.fuse(spokes)
-        valve = valve.cut(bore_cut)
-        valve = valve.removeSplitter()
-        fp.Shape = valve
-
+        valve = valve.fuse(spoke_x)
+        valve = valve.fuse(spoke_z)
+        valve = valve.cut(bore)
+        fp.Shape = valve.removeSplitter()
         fp.Ports = [
-            FreeCAD.Vector(0, 0, -H / 2.0),
-            FreeCAD.Vector(0, 0, H / 2.0),
+            FreeCAD.Vector(0, 0, -H / 2),
+            FreeCAD.Vector(0, 0,  H / 2),
         ]
         fp.PortDirections = [
             FreeCAD.Vector(0, 0, -1),
-            FreeCAD.Vector(0, 0, 1),
+            FreeCAD.Vector(0, 0,  1),
         ]
 
 class PypeBranch2(pypeType):  # use AttachExtensionPython
@@ -3746,3 +4121,4 @@ class SocketUnion(pypeType):
             FreeCAD.Vector(0, 0,  1),
         ]
         super(SocketUnion, self).execute(fp)  # perform common operations
+

@@ -1205,7 +1205,6 @@ class insertTerminalAdapterForm(dodoDialogs.protoPypeForm):
 
     def changeRating2(self, s):
         self.PRating = s
-        self.currentRatingLab.setText(translate("protoPypeForm", "Rating: ") + self.PRating)
         self.sizeList.blockSignals(True)
         try:
             self.fillSizes()
@@ -1862,8 +1861,6 @@ class insertReductForm(dodoDialogs.protoPypeForm):
         if 0 <= cur_idx < len(self.pipeDictList):
             cur_psize = self.pipeDictList[cur_idx].get("PSize")
         self.PRating = s
-        self.currentRatingLab.setText(
-            translate("protoPypeForm", "Rating: ") + self.PRating)
         self.sizeList.blockSignals(True)
         try:
             self.fillSizes()
@@ -1888,7 +1885,7 @@ class insertReductForm(dodoDialogs.protoPypeForm):
 
 class insertUboltForm(dodoDialogs.protoPypeForm):
     """
-    Dialog to insert U-bolts.
+    Dialog to insert pipe clamps.
     For position and orientation you can select
       - one or more circular edges,
       - nothing.
@@ -1898,7 +1895,7 @@ class insertUboltForm(dodoDialogs.protoPypeForm):
 
     def __init__(self):
         super(insertUboltForm, self).__init__(
-            translate("insertUboltForm", "Insert U-bolt"),
+            translate("insertUboltForm", "Insert clamp"),
             "Clamp",
             "DIN-UBolt",
             "clamp.svg",
@@ -1929,6 +1926,32 @@ class insertUboltForm(dodoDialogs.protoPypeForm):
         self.refNorm = None
         self.getReference()
 
+    def _isBeamClamp(self, row):
+        return row.get("ClampFamily", "").strip().lower() == "beam" or "ProductCode" in row
+
+    def _beamClampPropList(self, row):
+        return [
+            row["PSize"],
+            row.get("ClampFamily", self.PRating),
+            row.get("ProductCode", ""),
+            row.get("Bolt", ""),
+            float(pq(row["Y"])),
+            float(pq(row["X"])),
+            float(pq(row["V"])),
+            float(pq(row["T"])),
+            float(pq(row["W"])),
+        ]
+
+    def _selectedClampPosition(self, selex):
+        for sx in selex:
+            if sx.SubObjects:
+                for sub in sx.SubObjects:
+                    if hasattr(sub, "CenterOfMass"):
+                        return sub.CenterOfMass
+            if hasattr(sx.Object, "Placement"):
+                return sx.Object.Placement.Base
+        return FreeCAD.Vector(0, 0, 0)
+
     def getReference(self):
         selex = FreeCADGui.Selection.getSelectionEx()
         for sx in selex:
@@ -1941,12 +1964,26 @@ class insertUboltForm(dodoDialogs.protoPypeForm):
 
     def insert(self):
         selex = FreeCADGui.Selection.getSelectionEx()
+        _idx = self.sizeList.currentIndex()
+        if _idx < 0 or _idx >= len(self.pipeDictList):
+            return
+        current_row = self.pipeDictList[_idx]
+        if self._isBeamClamp(current_row):
+            FreeCAD.activeDocument().openTransaction(
+                translate("Transaction", "Insert beam clamp")
+            )
+            bc = pCmd.makeBeamClamp(
+                self._beamClampPropList(current_row),
+                pos=self._selectedClampPosition(selex),
+            )
+            if self.existingObjs.currentText() != "<none>":
+                pCmd.moveToPyLi(bc, self.existingObjs.currentText())
+            FreeCAD.activeDocument().commitTransaction()
+            FreeCAD.activeDocument().recompute()
+            return
         if len(selex) == 0:
             # size_selected = self.pipeDictList[self.sizeList.currentIndex()]
-            _idx = self.sizeList.currentIndex()
-            if _idx < 0 or _idx >= len(self.pipeDictList):
-                return
-            size_selected = self.pipeDictList[_idx]
+            size_selected = current_row
             rating = self.ratingList.currentText()
             propList = [
                 size_selected["PSize"],
@@ -2699,6 +2736,13 @@ class insertValveForm(dodoDialogs.protoPypeForm):
       propList    : [DN, VType, OD, ODBody, H, E, Conn, Kv]
       "Insert in pipe" checkbox + slider are hidden.
 
+    Flanged  (CSV has Conn == pressure class)
+    -------------------------------------------------------
+      CSV columns : Psize ; Vtype ; H ; Kv ; Conn [; BottomH ; TopH]
+      sizeList    : PSize   H
+      propList    : [DN, VType, H, Kv, Conn, BottomH, TopH]
+      Flange bolt pattern comes from Flange_ASME-BL-RF-<Conn>.csv.
+
     A rotation dial lets the last-inserted valve be spun around its
     flow axis (Z) in 15-degree increments, identical to insertElbowForm.
     """
@@ -2988,8 +3032,8 @@ class insertValveForm(dodoDialogs.protoPypeForm):
             r  = self._normRow(d)
 
             if self._isFlangedConn():
-                # Flanged Trunnion Ball valve
-                # propList: [DN, VType, H, Kv, Conn, optional TopH, optional WheelD]
+                # Flanged valve
+                # propList: [DN, VType, H, Kv, Conn, BottomH, TopH]
                 psize = r["psize"]
                 conn  = r["conn"]
                 propList = [
@@ -2998,8 +3042,8 @@ class insertValveForm(dodoDialogs.protoPypeForm):
                     float(pq(r["h"])),
                     float(pq(r.get("kv", "0"))),
                     conn,
+                    float(pq(r.get("bottomh", "0"))),
                     float(pq(r.get("toph", "0"))),
-                    float(pq(r.get("wheeld", "0"))),
                 ]
                 flgPropList = self._loadFlangePropList(conn, psize)
                 # Read actuator choice from radio buttons (default to "Handle")
@@ -3059,7 +3103,29 @@ class insertValveForm(dodoDialogs.protoPypeForm):
             if not (hasattr(obj, "PType") and obj.PType == "Valve"):
                 continue
 
-            if self._isSocketConn() and hasattr(obj, "Conn"):
+            if self._isFlangedConn() and hasattr(obj, "Conn"):
+                obj.PSize   = r["psize"]
+                obj.PRating = r.get("vtype", self.PRating)
+                obj.Height  = pq(r["h"])
+                obj.Kv      = float(pq(r.get("kv", "0")))
+                obj.Conn    = r["conn"]
+                if hasattr(obj, "BottomH"):
+                    obj.BottomH = pq(r.get("bottomh", "0"))
+                if hasattr(obj, "TopH"):
+                    obj.TopH = pq(r.get("toph", "0"))
+
+                flg = self._loadFlangePropList(r["conn"], r["psize"])
+                if flg:
+                    obj.FlgD   = flg[2]
+                    obj.Flgt   = flg[3]
+                    obj.FlgF   = flg[4]
+                    obj.FlgN   = flg[5]
+                    obj.FlgDf  = flg[6]
+                    obj.FlgDrf = flg[7]
+                    obj.FlgTrf = flg[8]
+                FreeCAD.activeDocument().recompute()
+
+            elif self._isSocketConn() and hasattr(obj, "Conn"):
                 # Socket-weld / Threaded valve
                 obj.PSize   = r["psize"]
                 obj.PRating = r.get("vtype", self.PRating)
@@ -3181,8 +3247,8 @@ class point2pointPipe(DraftTools.Wire):
                     float(v.Length),
                 ]
                 self.lastPipe = pCmd.makePipe(rating,propList, self.start, v)
-                if self.pform.combo.currentText() != "<none>":
-                    pCmd.moveToPyLi(self.lastPipe, self.pform.combo.currentText())
+                if self.pform.existingObjs.currentText() != "<none>":
+                    pCmd.moveToPyLi(self.lastPipe, self.pform.existingObjs.currentText())
                 self.start = self.point
                 FreeCAD.ActiveDocument.recompute()
                 if prev:
@@ -3197,8 +3263,8 @@ class point2pointPipe(DraftTools.Wire):
                             float(pq(d["OD"]) * 0.75),
                         ],
                     )
-                    if c and self.pform.combo.currentText() != "<none>":
-                        pCmd.moveToPyLi(c, self.pform.combo.currentText())
+                    if c and self.pform.existingObjs.currentText() != "<none>":
+                        pCmd.moveToPyLi(c, self.pform.existingObjs.currentText())
                     FreeCAD.ActiveDocument.recompute()
             if self.pform.cb1.isChecked():
                 rot = FreeCAD.DraftWorkingPlane.getPlacement().Rotation
